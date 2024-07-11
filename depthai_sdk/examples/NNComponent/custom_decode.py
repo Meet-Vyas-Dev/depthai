@@ -37,3 +37,4 @@ with OakCamera() as oak:
 
     oak.visualize(nn, callback=callback)
     oak.start(blocking=True)
+
