@@ -92,7 +92,8 @@ class ArgsParser:
         parser.add_argument("-monof", "--monoFps", type=float,
                             help="Mono cam fps: max 60.0 for H:720 or H:800, max 120.0 for H:400. Default: %(default)s")
         parser.add_argument('-fps', '--fps', type=float, help='Camera FPS applied to all sensors')
-
+        parser.add_argument('-defaultRes', '--defaultResolution', type=str, choices=[None, 'min', 'max'],
+                            help="Default resolution preset for the cameras that don't have a specific resolution set. Default: %(default)s")
         # ColorCamera ISP values
         parser.add_argument('-isp', '--ispScale', type=_commaSeparated(None), help="Sets ColorCamera's ISP scale")
         parser.add_argument('-sharpness', '--sharpness', type=_checkRange(0, 4),
@@ -133,7 +134,7 @@ class ArgsParser:
         # parser.add_argument("--cameraSharpness", type=_commaSeparated("all", int), nargs="+",
         #                     help="Specify image sharpness")
 
-        # Depth related arguments
+        # StereoDepth related arguments
         parser.add_argument("-dct", "--disparityConfidenceThreshold", type=_checkRange(0, 255),
                             help="Disparity confidence threshold, used for depth measurement.")
         parser.add_argument("-lrct", "--lrcThreshold", type=_checkRange(0, 10),
@@ -180,7 +181,7 @@ class ArgsParser:
         parser.add_argument("--irFloodBrightness", "-led", "--led", type=_checkRange(0, 1500),
                             help="For OAK-D Pro: specify IR flood illumination brightness, range: 0..1500 [mA], default 0 (turned off)")
 
-        args = parser.parse_args()
+        args = parser.parse_known_args()[0]
         # Parse arguments
         args.rgbResolution = rgb_resolution(args.rgbResolution)
         args.monoResolution = mono_resolution(args.monoResolution)

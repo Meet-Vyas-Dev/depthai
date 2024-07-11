@@ -1,25 +1,42 @@
+import threading
 from typing import List, Union, Dict, Any, Optional, Tuple
 
 import depthai as dai
-import numpy as np
-from distinctipy import distinctipy
 
 from depthai_sdk.classes import Detections, ImgLandmarks, SemanticSegmentation
+from depthai_sdk.classes.enum import ResizeMode
 from depthai_sdk.classes.packets import (
-    _Detection, DetectionPacket, TrackerPacket, SpatialBbMappingPacket, TwoStagePacket
+    Detection,
+    DetectionPacket,
+    ImgLandmarksPacket,
+    NnOutputPacket,
+    SemanticSegmentationPacket,
+    SpatialBbMappingPacket,
+    TwoStagePacket,
+    NNDataPacket
 )
-from depthai_sdk.components.nn_helper import ResizeMode
-from depthai_sdk.oak_outputs.normalize_bb import NormalizeBoundingBox
-from depthai_sdk.oak_outputs.xout.xout_base import StreamXout
+from depthai_sdk.oak_outputs.syncing import SequenceNumSync
+from depthai_sdk.oak_outputs.xout.xout_base import XoutBase, StreamXout
+from depthai_sdk.oak_outputs.xout.xout_depth import XoutDisparityDepth
 from depthai_sdk.oak_outputs.xout.xout_frames import XoutFrames
 from depthai_sdk.oak_outputs.xout.xout_seq_sync import XoutSeqSync
-from depthai_sdk.visualize.visualizer import Visualizer
-from depthai_sdk.visualize.visualizer_helper import hex_to_bgr, calc_disp_multiplier, colorize_disparity, draw_mappings
+from depthai_sdk.types import XoutNNOutputPacket
+from depthai_sdk.visualize.bbox import BoundingBox
+from depthai_sdk.visualize.colors import generate_colors, hex_to_bgr
 
-try:
-    import cv2
-except ImportError:
-    cv2 = None
+
+class XoutNnData(XoutBase):
+    def __init__(self, xout: StreamXout):
+        self.nndata_out = xout
+        super().__init__()
+
+    def xstreams(self) -> List[StreamXout]:
+        return [self.nndata_out]
+
+    def new_msg(self, name: str, msg: dai.NNData) -> NNDataPacket:
+        if name not in self._streams:
+            return
+        return NNDataPacket(name=self.get_packet_name(), nn_data=msg)
 
 
 class XoutNnResults(XoutSeqSync, XoutFrames):
@@ -29,7 +46,8 @@ class XoutNnResults(XoutSeqSync, XoutFrames):
     def __init__(self,
                  det_nn: 'NNComponent',
                  frames: StreamXout,
-                 nn_results: StreamXout):
+                 nn_results: StreamXout,
+                 bbox: BoundingBox):
         self.det_nn = det_nn
         self.nn_results = nn_results
 
@@ -38,14 +56,15 @@ class XoutNnResults(XoutSeqSync, XoutFrames):
 
         self.name = 'NN results'
         self.labels = None
+        self.bbox = bbox
 
         # TODO: add support for colors, generate new colors for each label that doesn't have colors
         if det_nn._labels:
             self.labels = []
             n_colors = [isinstance(label, str) for label in det_nn._labels].count(True)
-            # np.array of (b,g,r), 0..1
-            colors = np.array(distinctipy.get_colors(n_colors=n_colors, rng=123123, pastel_factor=0.5))[..., ::-1]
-            colors = [distinctipy.get_rgb256(clr) for clr in colors]  # List of (b,g,r), 0..255
+            # List of colors in BGR format
+            colors = generate_colors(n_colors)
+
             for label in det_nn._labels:
                 if isinstance(label, str):
                     text = label
@@ -58,179 +77,88 @@ class XoutNnResults(XoutSeqSync, XoutFrames):
 
                 self.labels.append((text, color))
 
-        self.normalizer = NormalizeBoundingBox(det_nn._size, det_nn._ar_resize_mode)
-        try:
-            self._frame_shape = self.det_nn._input.node.getPreviewSize()
-        except AttributeError:
-            self._frame_shape = self.det_nn._input.stream_size  # Replay
+        self._resize_mode: ResizeMode = det_nn._ar_resize_mode
+        self._nn_size: Tuple[int, int] = det_nn._size
 
-        self._frame_shape = np.array(self._frame_shape)[::-1]
+    def package(self, msgs: Dict) -> XoutNNOutputPacket:
+        nn_result = msgs[self.nn_results.name]
+        img = msgs[self.frames.name]
+        if type(nn_result) == dai.NNData:
+            decode_fn = self.det_nn._decode_fn
 
-        self.segmentation_colormap = None
+            if decode_fn is None:
+                return NnOutputPacket(self.get_packet_name(), img, nn_result, self.bbox)
 
-    def setup_visualize(self,
-                        visualizer: Visualizer,
-                        visualizer_enabled: bool,
-                        name: str = None):
-        super().setup_visualize(visualizer, visualizer_enabled, name)
+            decoded_nn_result = decode_fn(nn_result)
+            if type(decoded_nn_result) == Detections:
+                packet = DetectionPacket(self.get_packet_name(), img, nn_result, self.bbox)
+                return self._add_detections_to_packet(packet, decoded_nn_result)
+            elif type(decoded_nn_result) == ImgLandmarks:
+                return ImgLandmarksPacket(self.get_packet_name(), img, nn_result, decoded_nn_result, self.bbox)
+            elif type(decoded_nn_result) == SemanticSegmentation:
+                return SemanticSegmentationPacket(self.get_packet_name(), img, nn_result, decoded_nn_result, self.bbox)
+            raise ValueError(f'NN result decoding failed! decode() returned type {type(nn_result)}')
 
-    def on_callback(self, packet: Union[DetectionPacket, TrackerPacket]):
-        if self._visualizer and self._visualizer.frame_shape is None:
-            try:
-                shape = packet.imgFrame.getCvFrame().shape[:2]
-            except RuntimeError as e:
-                raise RuntimeError(f'Error getting frame shape - {e}')
-            if len(shape) == 1:
-                self._visualizer.frame_shape = self._frame_shape
-            else:
-                self._visualizer.frame_shape = shape
-                self._frame_shape = shape
+        elif type(nn_result) in [dai.ImgDetections, dai.SpatialImgDetections]:
+            packet = DetectionPacket(self.get_packet_name(), img, nn_result, self.bbox)
+            return self._add_detections_to_packet(packet, nn_result)
+        else:
+            raise ValueError(f'Unknown NN result type: {type(nn_result)}')
 
-        # Add detections to packet
-        if isinstance(packet.img_detections, dai.ImgDetections) \
-                or isinstance(packet.img_detections, dai.SpatialImgDetections) \
-                or isinstance(packet.img_detections, Detections):
-            for detection in packet.img_detections.detections:
-                d = _Detection()
-                d.img_detection = detection
-                d.label = self.labels[detection.label][0] if self.labels else str(detection.label)
-                d.color = self.labels[detection.label][1] if self.labels else (255, 255, 255)
-                bbox = self.normalizer.normalize(
-                    frame=np.zeros(self._frame_shape, dtype=bool),
-                    bbox=(detection.xmin, detection.ymin, detection.xmax, detection.ymax)
-                )
-                d.top_left = (int(bbox[0]), int(bbox[1]))
-                d.bottom_right = (int(bbox[2]), int(bbox[3]))
-                packet.detections.append(d)
-
-            if self._visualizer:
-                # Add detections to visualizer
-                self._visualizer.add_detections(
-                    packet.img_detections.detections,
-                    self.normalizer,
-                    self.labels,
-                    is_spatial=packet._is_spatial_detection()
-                )
-        elif isinstance(packet.img_detections, ImgLandmarks):
-            if not self._visualizer:
-                return
-
-            all_landmarks = packet.img_detections.landmarks
-            all_landmarks_indices = packet.img_detections.landmarks_indices
-            colors = packet.img_detections.colors
-            for landmarks, indices in zip(all_landmarks, all_landmarks_indices):
-                for i, landmark in enumerate(landmarks):
-                    l = self.normalizer.normalize(frame=np.zeros(self._frame_shape, dtype=bool),
-                                                  bbox=landmark)
-                    idx = indices[i]
-
-                    self._visualizer.add_line(pt1=tuple(l[0]), pt2=tuple(l[1]), color=colors[idx], thickness=4)
-                    self._visualizer.add_circle(coords=tuple(l[0]), radius=8, color=colors[idx], thickness=-1)
-                    self._visualizer.add_circle(coords=tuple(l[1]), radius=8, color=colors[idx], thickness=-1)
-        elif isinstance(packet.img_detections, SemanticSegmentation):
-            if not self._visualizer:
-                return
-
-            # Generate colormap if not already generated
-            if self.segmentation_colormap is None:
-                n_classes = len(self.labels) if self.labels else 8
-                self.segmentation_colormap = self._generate_colors(n_classes)
-
-            mask = np.array(packet.img_detections.mask).astype(np.uint8)
-            try:
-                colorized_mask = np.array(self.segmentation_colormap)[mask]
-            except IndexError:
-                unique_classes = np.unique(mask)
-                max_class = np.max(unique_classes)
-                new_colors = self._generate_colors(max_class - len(self.segmentation_colormap) + 1)
-                self.segmentation_colormap.extend(new_colors)
-
-            bbox = None
-            if self.normalizer.resize_mode == ResizeMode.LETTERBOX:
-                bbox = self.normalizer.get_letterbox_bbox(packet.frame, normalize=True)
-                input_h, input_w = self.normalizer.aspect_ratio
-                resize_bbox = bbox[0] * input_w, bbox[1] * input_h, bbox[2] * input_w, bbox[3] * input_h
-                resize_bbox = np.int0(resize_bbox)
-            else:
-                resize_bbox = self.normalizer.normalize(frame=np.zeros(self._frame_shape, dtype=bool),
-                                                        bbox=bbox or (0., 0., 1., 1.))
-
-            x1, y1, x2, y2 = resize_bbox
-            h, w = packet.frame.shape[:2]
-            # Stretch mode
-            if self.normalizer.resize_mode == ResizeMode.STRETCH:
-                colorized_mask = cv2.resize(colorized_mask, (w, h))
-            elif self.normalizer.resize_mode == ResizeMode.LETTERBOX:
-                colorized_mask = cv2.resize(colorized_mask[y1:y2, x1:x2], (w, h))
-            else:
-                padded_mask = np.zeros((h, w, 3), dtype=np.uint8)
-                resized_mask = cv2.resize(colorized_mask, (x2 - x1, y2 - y1))
-                padded_mask[y1:y2, x1:x2] = resized_mask
-                colorized_mask = padded_mask
-
-            self._visualizer.add_mask(colorized_mask, alpha=0.5)
-
-    def package(self, msgs: Dict):
-        if self.queue.full():
-            self.queue.get()  # Get one, so queue isn't full
-
-        decode_fn = self.det_nn._decode_fn or (self.det_nn._handler.decode if self.det_nn._handler else None)
-        packet = DetectionPacket(
-            self.get_packet_name(),
-            msgs[self.frames.name],
-            msgs[self.nn_results.name] if decode_fn is None else decode_fn(msgs[self.nn_results.name]),
-            self._visualizer
-        )
-
-        self.queue.put(packet, block=False)
-
-    def _generate_colors(self, n_colors, exclude=None):
-        colors = distinctipy.get_colors(n_colors, exclude / 255 if exclude else None,
-                                        rng=11, pastel_factor=0.3, n_attempts=100)
-        rgb_colors = np.array(colors) * 255
-        return rgb_colors.astype(np.uint8)
+    def _add_detections_to_packet(self,
+                                  packet: DetectionPacket,
+                                  dets: Union[dai.ImgDetections, dai.SpatialImgDetections, Detections]
+                                  ) -> DetectionPacket:
+        for detection in dets.detections:
+            packet.detections.append(Detection(
+                img_detection=detection if isinstance(detection, dai.ImgDetection) else None,
+                label_str=self.labels[detection.label][0] if self.labels else str(detection.label),
+                confidence=detection.confidence,
+                color=self.labels[detection.label][1] if self.labels else (255, 255, 255),
+                bbox=BoundingBox(detection),
+                angle=detection.angle if hasattr(detection, 'angle') else None,
+                ts=dets.getTimestamp()
+            ))
+        return packet
 
 
-class XoutSpatialBbMappings(XoutSeqSync, XoutFrames):
-    def __init__(self, device: dai.Device, frames: StreamXout, configs: StreamXout):
+class XoutSpatialBbMappings(XoutDisparityDepth, SequenceNumSync):
+    def __init__(self,
+                 device: dai.Device,
+                 stereo: dai.node.StereoDepth,
+                 frames: StreamXout,  # passthroughDepth
+                 configs: StreamXout,  # out
+                 dispScaleFactor: float,
+                 bbox: BoundingBox):
+        self._stereo = stereo
         self.frames = frames
         self.configs = configs
+        self.bbox = bbox
 
-        XoutFrames.__init__(self, frames)
-        XoutSeqSync.__init__(self, [frames, configs])
+        XoutDisparityDepth.__init__(self, device, frames, dispScaleFactor, None)
+        SequenceNumSync.__init__(self, 2)
 
-        self.device = device
-        self.multiplier = 255 / 95.0
-        self.factor = None
-        self.name = 'Depth & Bounding Boxes'
+    def new_msg(self, name: str, msg):
+        # Ignore frames that we aren't listening for
+        if name not in self._streams: return
+
+        synced = self.sync(msg.getSequenceNum(), name, msg)
+        if synced:
+            return self.package(synced)
+
+    def on_callback(self, packet) -> None:
+        pass
 
     def xstreams(self) -> List[StreamXout]:
         return [self.frames, self.configs]
 
-    def visualize(self, packet: SpatialBbMappingPacket):
-        if not self.factor:
-            size = (packet.imgFrame.getWidth(), packet.imgFrame.getHeight())
-            self.factor = calc_disp_multiplier(self.device, size)
-
-        depth = np.array(packet.imgFrame.getFrame())
-        with np.errstate(divide='ignore'):
-            disp = (self.factor / depth).astype(np.uint8)
-
-        packet.frame = colorize_disparity(disp, multiplier=self.multiplier)
-        draw_mappings(packet)
-
-        super().visualize(packet)
-
-    def package(self, msgs: Dict):
-        if self.queue.full():
-            self.queue.get()  # Get one, so queue isn't full
-        packet = SpatialBbMappingPacket(
+    def package(self, msgs: Dict) -> SpatialBbMappingPacket:
+        return SpatialBbMappingPacket(
             self.get_packet_name(),
             msgs[self.frames.name],
             msgs[self.configs.name],
-            self._visualizer
+            disp_scale_factor=self.disp_scale_factor,
         )
-        self.queue.put(packet, block=False)
 
 
 class XoutTwoStage(XoutNnResults):
@@ -238,11 +166,10 @@ class XoutTwoStage(XoutNnResults):
     Two stage syncing based on sequence number. Each frame produces ImgDetections msg that contains X detections.
     Each detection (if not on blacklist) will crop the original frame and forward it to the second (stage) NN for
     inferencing.
-    """
-    """
+
     msgs = {
         '1': TwoStageSyncPacket(),
-        '2': TwoStageSyncPacket(), 
+        '2': TwoStageSyncPacket(),
     }
     """
 
@@ -253,35 +180,33 @@ class XoutTwoStage(XoutNnResults):
                  det_out: StreamXout,
                  second_nn_out: StreamXout,
                  device: dai.Device,
-                 input_queue_name: str):
+                 input_queue_name: str,
+                 bbox: BoundingBox):
         self.second_nn_out = second_nn_out
         # Save StreamXout before initializing super()!
-        super().__init__(det_nn, frames, det_out)
+        super().__init__(det_nn, frames, det_out, bbox)
 
         self.msgs: Dict[str, Dict[str, Any]] = dict()
         self.det_nn = det_nn
         self.second_nn = second_nn
         self.name = 'Two-stage detection'
 
-        self.whitelist_labels: Optional[List[int]] = None
-        self.scale_bb: Optional[Tuple[int, int]] = None
-
-        conf = det_nn._multi_stage_config  # No types due to circular import...
-        if conf is not None:
-            self.labels = conf._labels
-            self.scale_bb = conf.scale_bb
+        self.whitelist_labels: Optional[List[int]] = second_nn._multi_stage_nn.whitelist_labels
+        self.scale_bb: Optional[Tuple[int, int]] = second_nn._multi_stage_nn.scale_bb
 
         self.device = device
         self.input_queue_name = input_queue_name
         self.input_queue = None
         self.input_cfg_queue = None
 
+        self.lock = threading.Lock()
+
     def xstreams(self) -> List[StreamXout]:
         return [self.frames, self.nn_results, self.second_nn_out]
 
     # No need for `def visualize()` as `XoutNnResults.visualize()` does what we want
 
-    def new_msg(self, name: str, msg: dai.Buffer) -> None:
+    def new_msg(self, name: str, msg: dai.Buffer):
         if name not in self._streams:
             return  # From Replay modules. TODO: better handling?
 
@@ -353,39 +278,31 @@ class XoutTwoStage(XoutNnResults):
 
                     self.input_cfg_queue.send(cfg)
 
-            # print(f'Added detection seq {seq}')
         elif name in self.frames.name:
             self.msgs[seq][name] = msg
-            # print(f'Added frame seq {seq}')
         else:
             raise ValueError('Message from unknown stream name received by TwoStageSeqSync!')
 
         if self.synced(seq):
-            # print('Synced', seq)
             # Frames synced!
-            if self.queue.full():
-                self.queue.get()  # Get one, so queue isn't full
-
+            dets = self.msgs[seq][self.nn_results.name]
             packet = TwoStagePacket(
                 self.get_packet_name(),
                 self.msgs[seq][self.frames.name],
-                self.msgs[seq][self.nn_results.name],
+                dets,
                 self.msgs[seq][self.second_nn_out.name],
                 self.whitelist_labels,
-                self._visualizer
+                self.bbox
             )
-            self.queue.put(packet, block=False)
 
-            # Throws RuntimeError: dictionary changed size during iteration
-            # for s in self.msgs:
-            #     if int(s) <= int(seq):
-            #         del self.msgs[s]
+            with self.lock:
+                new_msgs = {}
+                for name, msg in self.msgs.items():
+                    if int(name) > int(seq):
+                        new_msgs[name] = msg
+                self.msgs = new_msgs
 
-            new_msgs = {}
-            for name, msg in self.msgs.items():
-                if int(name) > int(seq):
-                    new_msgs[name] = msg
-            self.msgs = new_msgs
+            return self._add_detections_to_packet(packet, dets)
 
     def add_detections(self, seq: str, dets: dai.ImgDetections):
         # Used to match the scaled bounding boxes by the 2-stage NN script node
